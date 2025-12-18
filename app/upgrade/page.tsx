@@ -74,6 +74,7 @@ export default function UpgradePage() {
           </div>
 
           <button
+            type="button"
             onClick={startCheckout}
             disabled={loading}
             style={{
