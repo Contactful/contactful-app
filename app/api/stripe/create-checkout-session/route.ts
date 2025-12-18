@@ -1,100 +1,101 @@
+import { NextResponse } from "next/server";
 import Stripe from "stripe";
 import { createClient } from "@supabase/supabase-js";
 
-export const runtime = "nodejs"; // ważne: Stripe + node runtime
+export const runtime = "nodejs";
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
-  apiVersion: "2025-01-27.acacia", // jeśli TS krzyczy, usuń tę linię albo ustaw najnowszą wspieraną
+  apiVersion: "2025-01-27.acacia",
 });
 
 const supabaseAdmin = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
-  process.env.SUPABASE_SERVICE_ROLE_KEY!,
-  {
-    auth: {
-      persistSession: false,
-      autoRefreshToken: false,
-    },
-  }
+  process.env.SUPABASE_SERVICE_ROLE_KEY!
 );
 
-type Plan = "pro" | "talent" | "networking";
+// ✅ MAPOWANIE plan + billing → env var z price_id
+const priceMap = {
+  talent: {
+    monthly: process.env.STRIPE_PRICE_TALENT_MONTHLY!,
+    yearly: process.env.STRIPE_PRICE_TALENT_YEARLY!,
+    lifetime: process.env.STRIPE_PRICE_TALENT_LIFETIME!,
+  },
+  networking: {
+    monthly: process.env.STRIPE_PRICE_NETWORKING_MONTHLY!,
+    yearly: process.env.STRIPE_PRICE_NETWORKING_YEARLY!,
+    lifetime: process.env.STRIPE_PRICE_NETWORKING_LIFETIME!,
+  },
+  bundle: {
+    monthly: process.env.STRIPE_PRICE_BUNDLE_MONTHLY!,
+    yearly: process.env.STRIPE_PRICE_BUNDLE_YEARLY!,
+    lifetime: process.env.STRIPE_PRICE_BUNDLE_LIFETIME!,
+  },
+} as const;
 
-function getPriceId(plan: Plan): string {
-  const map: Record<Plan, string | undefined> = {
-    pro: process.env.STRIPE_PRICE_ID_PRO,
-    talent: process.env.STRIPE_PRICE_ID_TALENT,
-    networking: process.env.STRIPE_PRICE_ID_NETWORKING,
-  };
-
-  const priceId = map[plan];
-  if (!priceId) throw new Error(`Missing Stripe price id for plan: ${plan}`);
-  return priceId;
-}
+type Plan = keyof typeof priceMap; // "talent" | "networking" | "bundle"
+type Billing = keyof (typeof priceMap)["talent"]; // "monthly" | "yearly" | "lifetime"
 
 export async function POST(req: Request) {
   try {
     // 1) Auth header
-    const authHeader = req.headers.get("authorization") || "";
-    const match = authHeader.match(/^Bearer\s+(.+)$/i);
-    if (!match) {
-      return Response.json(
+    const auth = req.headers.get("authorization") || "";
+    const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
+    if (!token) {
+      return NextResponse.json(
         { error: "Missing Authorization: Bearer <access_token>" },
         { status: 401 }
       );
     }
-    const accessToken = match[1].trim();
 
-    // 2) Plan from body
+    // 2) Zweryfikuj usera w Supabase (service role)
+    const { data: userData, error: userErr } = await supabaseAdmin.auth.getUser(
+      token
+    );
+    if (userErr || !userData?.user) {
+      return NextResponse.json({ error: "Invalid access token" }, { status: 401 });
+    }
+    const user = userData.user;
+
+    // 3) Body: plan + billing
     const body = await req.json().catch(() => ({}));
-    const plan = body?.plan as Plan | undefined;
+    const plan = body.plan as Plan;
+    const billing = body.billing as Billing;
 
-    if (!plan || !["pro", "talent", "networking"].includes(plan)) {
-      return Response.json(
-        { error: "Invalid plan. Use one of: pro, talent, networking" },
+    if (!plan || !billing || !(plan in priceMap) || !(billing in priceMap.talent)) {
+      return NextResponse.json(
+        { error: "Invalid body. Expected { plan: talent|networking|bundle, billing: monthly|yearly|lifetime }" },
         { status: 400 }
       );
     }
 
-    // 3) Validate user via Supabase (service role)
-    const { data, error } = await supabaseAdmin.auth.getUser(accessToken);
-    if (error || !data?.user) {
-      return Response.json(
-        { error: "Invalid or expired Supabase access token" },
-        { status: 401 }
-      );
+    const priceId = priceMap[plan][billing];
+    if (!priceId) {
+      return NextResponse.json({ error: "Missing priceId env var for selection" }, { status: 500 });
     }
 
-    const user = data.user;
-    const supabaseUserId = user.id;
-    const email = user.email ?? undefined;
+    // 4) Checkout mode: subscription vs payment (lifetime = one-time)
+    const mode: Stripe.Checkout.SessionCreateParams.Mode =
+      billing === "lifetime" ? "payment" : "subscription";
 
-    // 4) Create Stripe Checkout
-    const priceId = getPriceId(plan);
-
-    const origin = req.headers.get("origin") || "https://app.contactful.app";
-    const successUrl = `${origin}/billing/success?session_id={CHECKOUT_SESSION_ID}`;
-    const cancelUrl = `${origin}/billing/cancel`;
-
+    // 5) Utwórz Stripe Checkout Session
     const session = await stripe.checkout.sessions.create({
-      mode: "subscription",
-      customer_email: email, // opcjonalnie
+      mode,
       line_items: [{ price: priceId, quantity: 1 }],
-      success_url: successUrl,
-      cancel_url: cancelUrl,
-      allow_promotion_codes: true,
-
-      // bardzo ważne: później webhook to odczyta
+      success_url: `${process.env.NEXT_PUBLIC_APP_URL || "https://app.contactful.app"}/?checkout=success`,
+      cancel_url: `${process.env.NEXT_PUBLIC_APP_URL || "https://app.contactful.app"}/?checkout=cancel`,
       metadata: {
-        supabase_user_id: supabaseUserId,
+        supabase_user_id: user.id,
         plan,
+        billing,
       },
+      client_reference_id: user.id,
     });
 
-    return Response.json({ url: session.url }, { status: 200 });
+    return NextResponse.json({ url: session.url });
   } catch (e: any) {
-    return Response.json(
-      { error: e?.message || "Unknown error" },
+    console.error(e);
+    return NextResponse.json(
+      { error: e?.message || "Server error" },
       { status: 500 }
     );
   }
