@@ -1,4 +1,4 @@
-k"use client";
+"use client";
 
 import { useEffect, useState } from "react";
 import { supabase } from "../../lib/supabaseClient";
@@ -13,32 +13,34 @@ export default function AuthCompletePage() {
 
     const run = async () => {
       try {
-        // 1) Jeśli wróciliśmy z OAuth z ?code=..., to WYMIENIAMY kod na sesję i zapisujemy ją
-        // (to jest kluczowe, żeby /upgrade miało session/access_token)
-        const hasCode = typeof window !== "undefined" && window.location.search.includes("code=");
-        if (hasCode) {
-          await supabase.auth.exchangeCodeForSession(window.location.href);
+        const url = new URL(window.location.href);
+
+        // 1) PKCE: wymień ?code=... na sesję (KLUCZOWE)
+        const code = url.searchParams.get("code");
+        if (code) {
+          const { error } = await supabase.auth.exchangeCodeForSession(code);
+          if (error) throw error;
         }
 
-        // 2) Pobieramy sesję
+        // 2) Odczytaj sesję
         const { data } = await supabase.auth.getSession();
 
-        // 3) Upgrade bierzemy z URL (pewne) albo z localStorage (fallback)
-        const urlUpgrade = new URLSearchParams(window.location.search).get("upgrade");
+        // 3) Upgrade z URL albo z localStorage
+        const u = url.searchParams.get("upgrade");
         const upgradeFromUrl =
-          urlUpgrade === "talent" || urlUpgrade === "networking" || urlUpgrade === "bundle"
-            ? (urlUpgrade as UpgradePlan)
+          u === "talent" || u === "networking" || u === "bundle"
+            ? (u as UpgradePlan)
             : null;
 
-        const lsUpgrade = localStorage.getItem("contactful_upgrade");
+        const ls = localStorage.getItem("contactful_upgrade");
         const upgradeFromLs =
-          lsUpgrade === "talent" || lsUpgrade === "networking" || lsUpgrade === "bundle"
-            ? (lsUpgrade as UpgradePlan)
+          ls === "talent" || ls === "networking" || ls === "bundle"
+            ? (ls as UpgradePlan)
             : null;
 
         const upgrade = upgradeFromUrl || upgradeFromLs;
 
-        // 4) Czyścimy URL (usuwa ?code= i #)
+        // 4) Wyczyść URL (usuń code/upgrade i hash)
         const cleanUrl = `${window.location.origin}/auth-complete`;
         window.history.replaceState({}, document.title, cleanUrl);
 
