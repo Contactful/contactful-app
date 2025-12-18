@@ -4,41 +4,52 @@ import { useEffect, useState } from "react";
 import { supabase } from "../../lib/supabaseClient";
 
 export default function AuthCompletePage() {
-  const [msg, setMsg] = useState("Completing sign-in…");
+  const [message, setMessage] = useState("Finalizing sign-in…");
 
   useEffect(() => {
     let cancelled = false;
 
-    const run = async () => {
-      // Daj Supabase chwilę na zakończenie wewnętrznego „cleanup” URL
-      await new Promise((r) => setTimeout(r, 80));
+    const completeAuth = async () => {
+      // 1️⃣ Daj Supabase chwilę na zapisanie sesji po OAuth / Magic Link
+      await new Promise((r) => setTimeout(r, 150));
 
-      const { data } = await supabase.auth.getSession();
+      const { data, error } = await supabase.auth.getSession();
+
+      // 2️⃣ Zawsze czyścimy URL (usuwamy #access_token itd.)
+      const cleanUrl = `${window.location.origin}/auth-complete`;
+      window.history.replaceState({}, document.title, cleanUrl);
 
       if (cancelled) return;
 
-      // Zawsze czyścimy URL do stabilnej postaci (bez #)
-      const cleanUrl = window.location.origin + "/auth-complete";
-      window.history.replaceState({}, document.title, cleanUrl);
-
-      if (data?.session) {
-        setMsg("Logged in ✅ Redirecting…");
-
-        const upgrade = localStorage.getItem("contactful_upgrade");
-        if (upgrade) {
-          window.location.replace(`/upgrade?plan=${encodeURIComponent(upgrade)}`);
-          return;
-        }
-
-        window.location.replace(`/`);
+      if (error) {
+        setMessage("Login failed. Please try again.");
         return;
       }
 
-      setMsg("Login not completed. Please try again.");
-      // zostaw na stronie – user może wrócić do /login
+      // 3️⃣ Jeśli sesja istnieje → decydujemy co dalej
+      if (data?.session) {
+        setMessage("Logged in ✅ Redirecting…");
+
+        const upgrade = localStorage.getItem("contactful_upgrade");
+
+        if (upgrade) {
+          // user przyszedł po upgrade
+          window.location.replace(
+            `/upgrade?plan=${encodeURIComponent(upgrade)}`
+          );
+          return;
+        }
+
+        // standardowy login (bez upgrade)
+        window.location.replace("/");
+        return;
+      }
+
+      // 4️⃣ Fallback (bardzo rzadki)
+      setMessage("Login not completed. Please go back to login.");
     };
 
-    run();
+    completeAuth();
 
     return () => {
       cancelled = true;
@@ -46,12 +57,29 @@ export default function AuthCompletePage() {
   }, []);
 
   return (
-    <main style={{ padding: 40, fontFamily: "Inter,system-ui,sans-serif" }}>
-      <h1>Contactful</h1>
-      <p>{msg}</p>
-      <p style={{ marginTop: 12, color: "#6b7280", fontSize: 12 }}>
-        If you’re stuck, go back to <a href="/login">/login</a>.
-      </p>
+    <main
+      style={{
+        minHeight: "100vh",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        fontFamily: "Inter, system-ui, sans-serif",
+        background: "#0b0e14",
+        color: "#fff",
+        padding: 24,
+      }}
+    >
+      <div style={{ textAlign: "center" }}>
+        <h1 style={{ marginBottom: 12 }}>Contactful</h1>
+        <p>{message}</p>
+
+        <p style={{ marginTop: 16, fontSize: 12, color: "#9ca3af" }}>
+          If nothing happens, go back to{" "}
+          <a href="/login" style={{ color: "#818cf8" }}>
+            /login
+          </a>
+        </p>
+      </div>
     </main>
   );
 }
