@@ -1,7 +1,9 @@
-k"use client";
+"use client";
 
 import { useEffect, useMemo, useState } from "react";
 import { supabase } from "../../lib/supabaseClient";
+
+type UpgradePlan = "talent" | "networking" | "bundle";
 
 export default function LoginPage() {
   const [email, setEmail] = useState("");
@@ -9,26 +11,16 @@ export default function LoginPage() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<null | "google" | "magic">(null);
 
-  const upgrade = useMemo(() => {
+  const upgrade = useMemo<UpgradePlan | null>(() => {
     if (typeof window === "undefined") return null;
     const u = new URLSearchParams(window.location.search).get("upgrade");
     if (u === "talent" || u === "networking" || u === "bundle") return u;
     return null;
   }, []);
 
+  // dodatkowo: zapisuj upgrade od razu po wejściu na /login?upgrade=...
   useEffect(() => {
-    // Jeśli user już ma sesję, idziemy prosto dalej
-    (async () => {
-      const { data } = await supabase.auth.getSession();
-      if (data?.session) {
-        if (upgrade) {
-          localStorage.setItem("contactful_upgrade", upgrade);
-          window.location.replace(`/upgrade?plan=${encodeURIComponent(upgrade)}`);
-        } else {
-          window.location.replace(`/`);
-        }
-      }
-    })();
+    if (upgrade) localStorage.setItem("contactful_upgrade", upgrade);
   }, [upgrade]);
 
   async function signInWithGoogle() {
@@ -37,9 +29,10 @@ export default function LoginPage() {
     setBusy("google");
 
     try {
-      if (upgrade) localStorage.setItem("contactful_upgrade", upgrade);
-
-      const redirectTo = `${window.location.origin}/auth-complete`;
+      const base = window.location.origin;
+      const redirectTo = upgrade
+        ? `${base}/auth-complete?upgrade=${encodeURIComponent(upgrade)}`
+        : `${base}/auth-complete`;
 
       const { error } = await supabase.auth.signInWithOAuth({
         provider: "google",
@@ -66,9 +59,10 @@ export default function LoginPage() {
         return;
       }
 
-      if (upgrade) localStorage.setItem("contactful_upgrade", upgrade);
-
-      const emailRedirectTo = `${window.location.origin}/auth-complete`;
+      const base = window.location.origin;
+      const emailRedirectTo = upgrade
+        ? `${base}/auth-complete?upgrade=${encodeURIComponent(upgrade)}`
+        : `${base}/auth-complete`;
 
       const { error } = await supabase.auth.signInWithOtp({
         email,
@@ -101,7 +95,7 @@ export default function LoginPage() {
       <div style={{ maxWidth: 520, margin: "0 auto", paddingTop: 40 }}>
         <h1 style={{ margin: 0, fontSize: 28 }}>Contactful</h1>
         <p style={{ color: "#9ca3af", marginTop: 8 }}>
-          Sign in to unlock features{upgrade ? ` (upgrade: ${upgrade})` : ""}.
+          Sign in{upgrade ? ` to upgrade: ${upgrade}` : ""}.
         </p>
 
         <div
@@ -177,10 +171,6 @@ export default function LoginPage() {
           {status && <p style={{ marginTop: 12, color: "#86efac" }}>{status}</p>}
           {error && <p style={{ marginTop: 12, color: "#fca5a5" }}>{error}</p>}
         </div>
-
-        <p style={{ color: "#6b7280", marginTop: 14, fontSize: 12 }}>
-          After sign-in, you’ll be redirected automatically.
-        </p>
       </div>
     </div>
   );
