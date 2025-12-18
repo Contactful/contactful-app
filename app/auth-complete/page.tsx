@@ -1,26 +1,44 @@
 "use client";
 
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { supabase } from "../../lib/supabaseClient";
 
 export default function AuthCompletePage() {
+  const [msg, setMsg] = useState("Completing sign-in…");
+
   useEffect(() => {
     let cancelled = false;
 
-    const finishAuth = async () => {
-      // czekamy aż Supabase skończy swoje wewnętrzne czyszczenie URL
-      await new Promise((r) => setTimeout(r, 50));
+    const run = async () => {
+      // Daj Supabase chwilę na zakończenie wewnętrznego „cleanup” URL
+      await new Promise((r) => setTimeout(r, 80));
 
       const { data } = await supabase.auth.getSession();
 
       if (cancelled) return;
 
-      // BEZWARUNKOWO czyścimy URL (hash + query)
+      // Zawsze czyścimy URL do stabilnej postaci (bez #)
       const cleanUrl = window.location.origin + "/auth-complete";
       window.history.replaceState({}, document.title, cleanUrl);
+
+      if (data?.session) {
+        setMsg("Logged in ✅ Redirecting…");
+
+        const upgrade = localStorage.getItem("contactful_upgrade");
+        if (upgrade) {
+          window.location.replace(`/upgrade?plan=${encodeURIComponent(upgrade)}`);
+          return;
+        }
+
+        window.location.replace(`/`);
+        return;
+      }
+
+      setMsg("Login not completed. Please try again.");
+      // zostaw na stronie – user może wrócić do /login
     };
 
-    finishAuth();
+    run();
 
     return () => {
       cancelled = true;
@@ -28,9 +46,12 @@ export default function AuthCompletePage() {
   }, []);
 
   return (
-    <main style={{ padding: 40 }}>
+    <main style={{ padding: 40, fontFamily: "Inter,system-ui,sans-serif" }}>
       <h1>Contactful</h1>
-      <p>Logged in ✅ You can close this tab.</p>
+      <p>{msg}</p>
+      <p style={{ marginTop: 12, color: "#6b7280", fontSize: 12 }}>
+        If you’re stuck, go back to <a href="/login">/login</a>.
+      </p>
     </main>
   );
 }
