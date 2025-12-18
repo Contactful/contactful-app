@@ -4,41 +4,32 @@ import { useEffect, useState } from "react";
 import { supabase } from "../../lib/supabaseClient";
 
 export default function AuthCompletePage() {
-  const [status, setStatus] = useState("Finishing login...");
+  const [msg, setMsg] = useState("Completing sign-in…");
 
   useEffect(() => {
-    async function finalize() {
-      const { data, error } = await supabase.auth.getSession();
+    (async () => {
+      const { data } = await supabase.auth.getSession();
 
-      if (error) {
-        setStatus("Error finishing login. You can close this tab.");
+      if (data?.session) {
+        setMsg("Logged in ✅ You can close this tab.");
+
+        // usuń # i query params z URL
+        const cleanUrl = window.location.origin + "/auth-complete";
+        window.history.replaceState({}, document.title, cleanUrl);
         return;
       }
 
-      if (data?.session) {
-        setStatus("Logged in. You can close this tab.");
-      } else {
-        setStatus("No active session. You can close this tab.");
-      }
-    }
-
-    finalize();
+      setMsg("Login not completed. Please try again.");
+      const cleanUrl = window.location.origin + "/auth-complete";
+      window.history.replaceState({}, document.title, cleanUrl);
+    })();
   }, []);
 
   return (
-    <div
-      style={{
-        minHeight: "100vh",
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        fontFamily: "system-ui, sans-serif",
-      }}
-    >
-      <div style={{ padding: 32, borderRadius: 16, border: "1px solid #333" }}>
-        <h1 style={{ fontSize: 22, marginBottom: 12 }}>Auth complete</h1>
-        <p>{status}</p>
-      </div>
-    </div>
+    <main style={{ padding: 40 }}>
+      <h1>Contactful</h1>
+      <p>{msg}</p>
+    </main>
   );
 }
+
