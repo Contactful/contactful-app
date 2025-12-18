@@ -1,4 +1,4 @@
-"use client";
+k"use client";
 
 import { useEffect, useState } from "react";
 import { supabase } from "../../lib/supabaseClient";
@@ -12,52 +12,59 @@ export default function AuthCompletePage() {
     let cancelled = false;
 
     const run = async () => {
-      // poczekaj aż Supabase zapisze sesję po callbacku
-      await new Promise((r) => setTimeout(r, 150));
+      try {
+        // 1) Jeśli wróciliśmy z OAuth z ?code=..., to WYMIENIAMY kod na sesję i zapisujemy ją
+        // (to jest kluczowe, żeby /upgrade miało session/access_token)
+        const hasCode = typeof window !== "undefined" && window.location.search.includes("code=");
+        if (hasCode) {
+          await supabase.auth.exchangeCodeForSession(window.location.href);
+        }
 
-      const { data } = await supabase.auth.getSession();
+        // 2) Pobieramy sesję
+        const { data } = await supabase.auth.getSession();
 
-      // wyciągnij upgrade z URL (najpewniejsze)
-      const urlUpgrade = new URLSearchParams(window.location.search).get("upgrade");
-      const upgradeFromUrl =
-        urlUpgrade === "talent" || urlUpgrade === "networking" || urlUpgrade === "bundle"
-          ? (urlUpgrade as UpgradePlan)
-          : null;
+        // 3) Upgrade bierzemy z URL (pewne) albo z localStorage (fallback)
+        const urlUpgrade = new URLSearchParams(window.location.search).get("upgrade");
+        const upgradeFromUrl =
+          urlUpgrade === "talent" || urlUpgrade === "networking" || urlUpgrade === "bundle"
+            ? (urlUpgrade as UpgradePlan)
+            : null;
 
-      // fallback na localStorage
-      const lsUpgrade = localStorage.getItem("contactful_upgrade");
-      const upgradeFromLs =
-        lsUpgrade === "talent" || lsUpgrade === "networking" || lsUpgrade === "bundle"
-          ? (lsUpgrade as UpgradePlan)
-          : null;
+        const lsUpgrade = localStorage.getItem("contactful_upgrade");
+        const upgradeFromLs =
+          lsUpgrade === "talent" || lsUpgrade === "networking" || lsUpgrade === "bundle"
+            ? (lsUpgrade as UpgradePlan)
+            : null;
 
-      const upgrade = upgradeFromUrl || upgradeFromLs;
+        const upgrade = upgradeFromUrl || upgradeFromLs;
 
-      // zawsze czyścimy URL do stabilnego (bez # i bez query)
-      const cleanUrl = `${window.location.origin}/auth-complete`;
-      window.history.replaceState({}, document.title, cleanUrl);
+        // 4) Czyścimy URL (usuwa ?code= i #)
+        const cleanUrl = `${window.location.origin}/auth-complete`;
+        window.history.replaceState({}, document.title, cleanUrl);
 
-      if (cancelled) return;
+        if (cancelled) return;
 
-      if (data?.session) {
-        setMessage("Logged in ✅ Redirecting…");
+        if (data?.session) {
+          setMessage("Logged in ✅ Redirecting…");
 
-        if (upgrade) {
-          // zostaw w localStorage na wszelki wypadek
-          localStorage.setItem("contactful_upgrade", upgrade);
-          window.location.replace(`/upgrade?plan=${encodeURIComponent(upgrade)}`);
+          if (upgrade) {
+            localStorage.setItem("contactful_upgrade", upgrade);
+            window.location.replace(`/upgrade?plan=${encodeURIComponent(upgrade)}`);
+            return;
+          }
+
+          window.location.replace(`/`);
           return;
         }
 
-        window.location.replace(`/`);
-        return;
+        setMessage("Login not completed. Please go back to /login.");
+      } catch (e: any) {
+        if (cancelled) return;
+        setMessage(e?.message ? `Auth error: ${e.message}` : "Auth error. Please try again.");
       }
-
-      setMessage("Login not completed. Please go back to /login.");
     };
 
     run();
-
     return () => {
       cancelled = true;
     };
@@ -67,9 +74,6 @@ export default function AuthCompletePage() {
     <main style={{ padding: 40, fontFamily: "Inter,system-ui,sans-serif" }}>
       <h1>Contactful</h1>
       <p>{message}</p>
-      <p style={{ marginTop: 12, fontSize: 12, color: "#6b7280" }}>
-        If you’re stuck, go back to <a href="/login">/login</a>.
-      </p>
     </main>
   );
 }
