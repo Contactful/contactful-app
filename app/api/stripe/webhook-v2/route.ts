@@ -2,7 +2,6 @@ import Stripe from "stripe";
 import { createClient } from "@supabase/supabase-js";
 
 export const runtime = "nodejs";
-export const dynamic = "force-dynamic";
 
 type Plan = "talent" | "networking" | "bundle";
 type Billing = "monthly" | "yearly" | "lifetime";
@@ -28,9 +27,18 @@ function normalizeBilling(b: any): Billing | null {
   return null;
 }
 
-function farFutureIso() {
-  // lifetime: 100 lat w przód
-  return new Date(Date.now() + 100 * 365 * 24 * 60 * 60 * 1000).toISOString();
+function pickSupabaseUserId(meta: Record<string, any>): string | null {
+  const v = meta?.supabase_user_id;
+  if (typeof v === "string" && v.length > 10) return v;
+  return null;
+}
+
+/**
+ * GET tylko do szybkiego testu w prod:
+ * curl -i https://app.contactful.app/api/stripe/webhook-v2
+ */
+export async function GET() {
+  return new Response("ok", { status: 200 });
 }
 
 export async function POST(req: Request) {
@@ -42,10 +50,10 @@ export async function POST(req: Request) {
 
     const stripe = new Stripe(stripeSecret);
     const supabaseAdmin = createClient(supabaseUrl, supabaseServiceRole, {
-      auth: { persistSession: false, autoRefreshToken: false },
+      auth: { persistSession: false },
     });
 
-    // RAW body do weryfikacji podpisu Stripe
+    // Stripe wymaga RAW body do weryfikacji podpisu
     const rawBody = await req.text();
     const sig = req.headers.get("stripe-signature");
     if (!sig) return new Response("Missing stripe-signature", { status: 400 });
@@ -54,155 +62,168 @@ export async function POST(req: Request) {
     try {
       event = stripe.webhooks.constructEvent(rawBody, sig, webhookSecret);
     } catch (err: any) {
-      console.error("Webhook signature verification failed:", err?.message || err);
-      return new Response(`Webhook signature verification failed: ${err?.message || String(err)}`, { status: 400 });
+      return new Response(`Webhook signature verification failed: ${err?.message || String(err)}`, {
+        status: 400,
+      });
     }
 
-    async function upsertSubscription(params: {
-      user_id: string;                 // <-- w Twojej tabeli jest user_id
+    // ===== Helpers DB =====
+
+    async function upsertSubscription(row: {
+      supabase_user_id: string;
       plan: Plan;
       billing: Billing;
       status: string;
-      valid_until: string | null;
       stripe_customer_id?: string | null;
       stripe_subscription_id?: string | null;
       stripe_checkout_session_id?: string | null;
       current_period_end?: string | null;
+      valid_until?: string | null;
     }) {
+      // Uwaga: masz unique index na (supabase_user_id, plan)
+      // więc robimy upsert onConflict właśnie na tych polach.
       const payload = {
-        user_id: params.user_id,
-        supabase_user_id: params.user_id, // zostawiamy spójnie (możesz później usunąć tę kolumnę)
-        plan: params.plan,
-        billing: params.billing,
-        status: params.status,
-        valid_until: params.valid_until,
-        stripe_customer_id: params.stripe_customer_id ?? null,
-        stripe_subscription_id: params.stripe_subscription_id ?? null,
-        stripe_checkout_session_id: params.stripe_checkout_session_id ?? null,
-        current_period_end: params.current_period_end ?? null,
+        supabase_user_id: row.supabase_user_id,
+        plan: row.plan,
+        billing: row.billing,
+        status: row.status,
+        stripe_customer_id: row.stripe_customer_id ?? null,
+        stripe_subscription_id: row.stripe_subscription_id ?? null,
+        stripe_checkout_session_id: row.stripe_checkout_session_id ?? null,
+        current_period_end: row.current_period_end ?? null,
+        valid_until: row.valid_until ?? null,
         updated_at: new Date().toISOString(),
       };
 
       const { error } = await supabaseAdmin
         .from("subscriptions")
-        .upsert(payload, { onConflict: "user_id,plan" });
+        .upsert(payload, { onConflict: "supabase_user_id,plan" });
 
-      if (error) throw new Error(`Supabase upsert error: ${error.message}`);
+      if (error) throw new Error(`Supabase upsert failed: ${error.message}`);
     }
 
-    async function updateByStripeSubscriptionId(stripe_subscription_id: string, patch: any) {
+    async function updateByStripeSubscriptionId(
+      stripe_subscription_id: string,
+      patch: Partial<{
+        status: string;
+        current_period_end: string | null;
+        valid_until: string | null;
+        stripe_customer_id: string | null;
+      }>
+    ) {
       const { error } = await supabaseAdmin
         .from("subscriptions")
         .update({ ...patch, updated_at: new Date().toISOString() })
         .eq("stripe_subscription_id", stripe_subscription_id);
 
-      if (error) throw new Error(`Supabase update error: ${error.message}`);
+      if (error) throw new Error(`Supabase update failed: ${error.message}`);
     }
 
+    // ===== Event handling =====
+
     switch (event.type) {
+      /**
+       * Najważniejsze dla subskrypcji checkout.
+       * Z Twoich danych: metadata ma plan/billing/supabase_user_id ✅
+       */
       case "checkout.session.completed": {
         const session = event.data.object as Stripe.Checkout.Session;
 
-        const userId = session.metadata?.supabase_user_id; // metadata z create-checkout-session
-        const plan = normalizePlan(session.metadata?.plan);
-        const billing = normalizeBilling(session.metadata?.billing);
+        const meta = (session.metadata || {}) as Record<string, any>;
+        const plan = normalizePlan(meta.plan);
+        const billing = normalizeBilling(meta.billing);
+        const supabaseUserId = pickSupabaseUserId(meta);
 
-        if (!userId || !plan || !billing) {
-          console.warn("Missing metadata in checkout.session.completed", { metadata: session.metadata, id: session.id });
-          break; // nie 500, żeby Stripe nie retryował bez sensu
+        if (!plan || !billing || !supabaseUserId) {
+          // Nie wywalamy 500 – Stripe będzie retryował.
+          // Lepiej 200 i log, ale tu zwrócimy 200 i zignorujemy.
+          console.warn("checkout.session.completed missing metadata", {
+            plan: meta.plan,
+            billing: meta.billing,
+            supabase_user_id: meta.supabase_user_id,
+          });
+          break;
         }
 
         const stripeCustomerId =
           typeof session.customer === "string" ? session.customer : session.customer?.id ?? null;
 
-        // LIFETIME = mode=payment
-        if (session.mode === "payment") {
-          await upsertSubscription({
-            user_id: userId,
-            plan,
-            billing: "lifetime",
-            status: "lifetime",
-            valid_until: farFutureIso(),
-            stripe_customer_id: stripeCustomerId,
-            stripe_checkout_session_id: session.id,
-            stripe_subscription_id: null,
-            current_period_end: null,
-          });
-          break;
-        }
-
-        // SUBSCRIPTION = mode=subscription
-        const subscriptionId =
+        const stripeSubscriptionId =
           typeof session.subscription === "string"
             ? session.subscription
             : session.subscription?.id ?? null;
 
+        // Jeśli to tryb subscription, mamy subscriptionId i możemy dociągnąć current_period_end
         let currentPeriodEndIso: string | null = null;
+        let status: string = "active";
 
-        if (subscriptionId) {
-          const sub = await stripe.subscriptions.retrieve(subscriptionId);
+        if (stripeSubscriptionId) {
+          const retrieved = await stripe.subscriptions.retrieve(stripeSubscriptionId);
+          const sub = retrieved.data; // ✅ Stripe v20: Response<Subscription> → .data
           currentPeriodEndIso = toIsoFromUnixSeconds(sub.current_period_end);
+          status = sub.status || "active";
         }
 
         await upsertSubscription({
-          user_id: userId,
+          supabase_user_id: supabaseUserId,
           plan,
           billing,
-          status: "active",
-          valid_until: currentPeriodEndIso,
+          status,
           stripe_customer_id: stripeCustomerId,
+          stripe_subscription_id: stripeSubscriptionId,
           stripe_checkout_session_id: session.id,
-          stripe_subscription_id: subscriptionId,
           current_period_end: currentPeriodEndIso,
+          // valid_until możesz trzymać jako alias current_period_end (opcjonalnie)
+          valid_until: currentPeriodEndIso,
         });
 
         break;
       }
 
-      case "customer.subscription.created":
+      /**
+       * Aktualizacje subskrypcji: zmiana statusu, okresu, anulowanie na koniec itd.
+       */
       case "customer.subscription.updated": {
         const sub = event.data.object as Stripe.Subscription;
 
         const subscriptionId = sub.id;
-        const status = sub.status; // active, past_due, canceled...
+        const status = sub.status;
         const currentPeriodEndIso = toIsoFromUnixSeconds(sub.current_period_end);
 
-        // aktualizujemy rekord po stripe_subscription_id
         await updateByStripeSubscriptionId(subscriptionId, {
           status,
-          valid_until: currentPeriodEndIso,
           current_period_end: currentPeriodEndIso,
+          valid_until: currentPeriodEndIso,
           stripe_customer_id: typeof sub.customer === "string" ? sub.customer : sub.customer?.id ?? null,
         });
 
         break;
       }
 
+      /**
+       * Usunięcie subskrypcji (np. natychmiastowe)
+       */
       case "customer.subscription.deleted": {
         const sub = event.data.object as Stripe.Subscription;
-        const subscriptionId = sub.id;
 
-        await updateByStripeSubscriptionId(subscriptionId, {
+        await updateByStripeSubscriptionId(sub.id, {
           status: "canceled",
-          valid_until: toIsoFromUnixSeconds(sub.current_period_end),
           current_period_end: toIsoFromUnixSeconds(sub.current_period_end),
+          valid_until: toIsoFromUnixSeconds(sub.current_period_end),
         });
 
         break;
       }
 
       default:
+        // inne eventy ignorujemy
         break;
     }
 
     return new Response("ok", { status: 200 });
   } catch (e: any) {
-    console.error("Stripe webhook error:", e?.message || e);
+    console.error("Stripe webhook v2 error:", e?.message || e);
     return new Response(`Webhook handler error: ${e?.message || String(e)}`, { status: 500 });
   }
-}
-
-export async function GET() {
-  return new Response("Stripe webhook is alive. Use POST.", { status: 200 });
 }
 
