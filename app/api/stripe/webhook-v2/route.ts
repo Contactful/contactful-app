@@ -1,243 +1,150 @@
-// app/api/stripe/webhook-v2/route.ts
 import Stripe from "stripe";
 import { createClient } from "@supabase/supabase-js";
 
 export const runtime = "nodejs";
 
-type Plan = "talent" | "networking" | "bundle";
-type Billing = "monthly" | "yearly" | "lifetime";
+/* -------------------- helpers -------------------- */
 
-function assertEnv(name: string) {
+function assertEnv(name: string): string {
   const v = process.env[name];
   if (!v) throw new Error(`Missing env: ${name}`);
   return v;
 }
 
-function toIsoFromUnixSeconds(sec?: number | null) {
-  if (!sec) return null;
-  return new Date(sec * 1000).toISOString();
+function toIsoFromUnix(sec?: number | null): string | null {
+  return sec ? new Date(sec * 1000).toISOString() : null;
 }
 
-function normalizePlan(p: any): Plan | null {
-  if (p === "talent" || p === "networking" || p === "bundle") return p;
-  return null;
+/** Stripe v20 może zwracać Response<T> albo T */
+function unwrapStripe<T>(v: any): T {
+  return v && typeof v === "object" && "data" in v ? (v.data as T) : (v as T);
 }
 
-function normalizeBilling(b: any): Billing | null {
-  if (b === "monthly" || b === "yearly" || b === "lifetime") return b;
-  return null;
-}
-
-type SubscriptionRow = {
-  supabase_user_id: string;
-  plan: Plan;
-  billing: Billing;
-  status: string;
-  stripe_customer_id?: string | null;
-  stripe_subscription_id?: string | null;
-  stripe_checkout_session_id?: string | null;
-  current_period_end?: string | null;
-};
+/* -------------------- handler -------------------- */
 
 export async function POST(req: Request) {
+  const stripe = new Stripe(assertEnv("STRIPE_SECRET_KEY"));
+  const webhookSecret = assertEnv("STRIPE_WEBHOOK_SECRET");
+
+  const supabase = createClient(
+    assertEnv("NEXT_PUBLIC_SUPABASE_URL"),
+    assertEnv("SUPABASE_SERVICE_ROLE_KEY"),
+    { auth: { persistSession: false } }
+  );
+
+  const sig = req.headers.get("stripe-signature");
+  if (!sig) {
+    return new Response("Missing stripe-signature", { status: 400 });
+  }
+
+  const rawBody = await req.text();
+
+  let event: Stripe.Event;
   try {
-    const stripeSecret = assertEnv("STRIPE_SECRET_KEY");
-    const webhookSecret = assertEnv("STRIPE_WEBHOOK_SECRET");
-    const supabaseUrl = assertEnv("NEXT_PUBLIC_SUPABASE_URL");
-    const supabaseServiceRole = assertEnv("SUPABASE_SERVICE_ROLE_KEY");
+    event = stripe.webhooks.constructEvent(rawBody, sig, webhookSecret);
+  } catch (err: any) {
+    console.error("❌ Webhook signature error:", err.message);
+    return new Response("Invalid signature", { status: 400 });
+  }
 
-    const stripe = new Stripe(stripeSecret);
-    const supabaseAdmin = createClient(supabaseUrl, supabaseServiceRole);
-
-    // Stripe wymaga RAW body do weryfikacji podpisu
-    const rawBody = await req.text();
-    const sig = req.headers.get("stripe-signature");
-    if (!sig) return new Response("Missing stripe-signature", { status: 400 });
-
-    let event: Stripe.Event;
-    try {
-      event = stripe.webhooks.constructEvent(rawBody, sig, webhookSecret);
-    } catch (err: any) {
-      return new Response(`Webhook signature verification failed: ${err?.message || err}`, {
-        status: 400,
-      });
-    }
-
-    async function upsertByStripeSubscriptionId(payload: SubscriptionRow) {
-      // Zakładamy, że masz UNIQUE na stripe_subscription_id
-      const { error } = await supabaseAdmin
-        .from("subscriptions")
-        .upsert(
-          {
-            ...payload,
-            updated_at: new Date().toISOString(),
-          },
-          { onConflict: "stripe_subscription_id" }
-        );
-
-      if (error) throw error;
-    }
-
-    async function upsertByCheckoutSessionId(payload: SubscriptionRow) {
-      // Zakładamy, że masz UNIQUE na stripe_checkout_session_id
-      const { error } = await supabaseAdmin
-        .from("subscriptions")
-        .upsert(
-          {
-            ...payload,
-            updated_at: new Date().toISOString(),
-          },
-          { onConflict: "stripe_checkout_session_id" }
-        );
-
-      if (error) throw error;
-    }
-
-    async function updateByStripeSubscriptionId(stripeSubscriptionId: string, patch: Partial<SubscriptionRow>) {
-      const { error } = await supabaseAdmin
-        .from("subscriptions")
-        .update({
-          ...patch,
-          updated_at: new Date().toISOString(),
-        })
-        .eq("stripe_subscription_id", stripeSubscriptionId);
-
-      if (error) throw error;
-    }
-
-    // =========================
-    // EVENT HANDLING
-    // =========================
+  try {
     switch (event.type) {
+      /* ---------------- checkout completed ---------------- */
       case "checkout.session.completed": {
         const session = event.data.object as Stripe.Checkout.Session;
 
-        // metadata, które ustawiasz w create-checkout-session
-        const plan = normalizePlan((session.metadata as any)?.plan);
-        const billing = normalizeBilling((session.metadata as any)?.billing);
-        const supabaseUserId = (session.metadata as any)?.supabase_user_id as string | undefined;
+        const userId = session.metadata?.supabase_user_id;
+        const plan = session.metadata?.plan;
+        const billing = session.metadata?.billing;
 
-        if (!plan || !billing || !supabaseUserId) {
-          // Nie przerywamy webhooka błędem 500 — po prostu log i 200,
-          // żeby Stripe nie spamował retry jeśli metadata nie ma.
-          console.warn("Webhook: missing/invalid metadata", {
-            plan,
-            billing,
-            supabaseUserId,
-            sessionId: session.id,
-          });
-          return new Response("ok", { status: 200 });
+        if (!userId || !plan || !billing) {
+          console.warn("⚠️ Missing metadata", session.id);
+          break;
         }
 
-        const stripeCustomerId =
-          typeof session.customer === "string"
-            ? session.customer
-            : (session.customer as any)?.id ?? null;
-
-        const stripeSubscriptionId =
-          typeof session.subscription === "string"
-            ? session.subscription
-            : (session.subscription as any)?.id ?? null;
-
-        // status + current_period_end (dla subscription)
+        let currentPeriodEnd: string | null = null;
         let status = "active";
-        let currentPeriodEndIso: string | null = null;
 
-        if (session.mode === "subscription" && stripeSubscriptionId) {
-          const retrieved = await stripe.subscriptions.retrieve(stripeSubscriptionId);
-          // Stripe v20 typing bywa mylący w TS – runtime to normalny obiekt subskrypcji
-          const sub: any = retrieved;
+        if (session.subscription) {
+          const sub = unwrapStripe<Stripe.Subscription>(
+            await stripe.subscriptions.retrieve(
+              session.subscription as string
+            )
+          );
 
-          status = sub.status || "active";
-          currentPeriodEndIso = toIsoFromUnixSeconds(sub.current_period_end);
+          currentPeriodEnd = toIsoFromUnix(sub.current_period_end);
+          status = sub.status ?? "active";
         }
 
-        const payload: SubscriptionRow = {
-          supabase_user_id: supabaseUserId,
-          plan,
-          billing,
-          status,
-          stripe_customer_id: stripeCustomerId,
-          stripe_subscription_id: stripeSubscriptionId,
-          stripe_checkout_session_id: session.id,
-          current_period_end: currentPeriodEndIso,
-        };
-
-        // Preferuj upsert po stripe_subscription_id, ale fallback na session_id
-        if (stripeSubscriptionId) {
-          await upsertByStripeSubscriptionId(payload);
-        } else {
-          await upsertByCheckoutSessionId(payload);
-        }
+        await supabase
+          .from("subscriptions")
+          .upsert(
+            {
+              supabase_user_id: userId,
+              plan,
+              billing,
+              status,
+              stripe_customer_id:
+                typeof session.customer === "string"
+                  ? session.customer
+                  : null,
+              stripe_subscription_id:
+                typeof session.subscription === "string"
+                  ? session.subscription
+                  : null,
+              stripe_checkout_session_id: session.id,
+              current_period_end: currentPeriodEnd,
+              updated_at: new Date().toISOString(),
+            },
+            {
+              onConflict: "supabase_user_id,plan",
+            }
+          );
 
         break;
       }
 
-      case "customer.subscription.created":
+      /* ---------------- subscription updated ---------------- */
       case "customer.subscription.updated": {
-        const subObj = event.data.object as Stripe.Subscription;
+        const sub = unwrapStripe<Stripe.Subscription>(event.data.object);
 
-        const stripeSubscriptionId = subObj.id;
-        const stripeCustomerId =
-          typeof subObj.customer === "string" ? subObj.customer : (subObj.customer as any)?.id ?? null;
-
-        const status = (subObj as any).status || "active";
-        const currentPeriodEndIso = toIsoFromUnixSeconds((subObj as any).current_period_end);
-
-        // Tu plan/billing/supabase_user_id bierzemy z metadata subskrypcji,
-        // ale jeśli nie masz ich na sub, to zostawiamy tylko update statusu/period_end.
-        const plan = normalizePlan((subObj.metadata as any)?.plan);
-        const billing = normalizeBilling((subObj.metadata as any)?.billing);
-        const supabaseUserId = (subObj.metadata as any)?.supabase_user_id as string | undefined;
-
-        if (plan && billing && supabaseUserId) {
-          await upsertByStripeSubscriptionId({
-            supabase_user_id: supabaseUserId,
-            plan,
-            billing,
-            status,
-            stripe_customer_id: stripeCustomerId,
-            stripe_subscription_id: stripeSubscriptionId,
-            current_period_end: currentPeriodEndIso,
-          });
-        } else {
-          // Minimalny update — bez plan/billing jeśli metadata nie ma
-          await updateByStripeSubscriptionId(stripeSubscriptionId, {
-            status,
-            current_period_end: currentPeriodEndIso,
-            stripe_customer_id: stripeCustomerId,
-          });
-        }
+        await supabase
+          .from("subscriptions")
+          .update({
+            status: sub.status,
+            current_period_end: toIsoFromUnix(sub.current_period_end),
+            updated_at: new Date().toISOString(),
+          })
+          .eq("stripe_subscription_id", sub.id);
 
         break;
       }
 
+      /* ---------------- subscription deleted ---------------- */
       case "customer.subscription.deleted": {
-        const subObj = event.data.object as Stripe.Subscription;
-        const stripeSubscriptionId = subObj.id;
+        const sub = unwrapStripe<Stripe.Subscription>(event.data.object);
 
-        await updateByStripeSubscriptionId(stripeSubscriptionId, {
-          status: "canceled",
-          current_period_end: toIsoFromUnixSeconds((subObj as any).current_period_end),
-        });
+        await supabase
+          .from("subscriptions")
+          .update({
+            status: "canceled",
+            current_period_end: toIsoFromUnix(sub.current_period_end),
+            updated_at: new Date().toISOString(),
+          })
+          .eq("stripe_subscription_id", sub.id);
 
-        break;
-      }
-
-      // (opcjonalnie) jeśli chcesz — często wystarcza do “podtrzymania active”
-      case "invoice.payment_succeeded": {
-        // nie musisz nic robić — ale możesz np. logować
         break;
       }
 
       default:
-        // ignorujemy resztę
+        // ignore other events
         break;
     }
 
     return new Response("ok", { status: 200 });
-  } catch (e: any) {
-    console.error("Stripe webhook-v2 error:", e?.message || e);
-    return new Response(`Webhook handler error: ${e?.message || String(e)}`, { status: 500 });
+  } catch (err: any) {
+    console.error("❌ Webhook handler error:", err);
+    return new Response("Webhook handler failed", { status: 500 });
   }
 }
+
