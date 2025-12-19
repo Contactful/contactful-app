@@ -15,9 +15,15 @@ function toIsoFromUnix(sec?: number | null): string | null {
   return sec ? new Date(sec * 1000).toISOString() : null;
 }
 
-/** Stripe v20 może zwracać Response<T> albo T */
+/** Stripe v20 czasem zwraca Response<T>, czasem T */
 function unwrapStripe<T>(v: any): T {
   return v && typeof v === "object" && "data" in v ? (v.data as T) : (v as T);
+}
+
+/** Typy Stripe v20 potrafią nie mieć current_period_end → czytamy bezpiecznie */
+function getCurrentPeriodEndIso(sub: any): string | null {
+  const sec = sub?.current_period_end ?? sub?.currentPeriodEnd ?? null; // fallback
+  return typeof sec === "number" ? toIsoFromUnix(sec) : null;
 }
 
 /* -------------------- handler -------------------- */
@@ -33,9 +39,7 @@ export async function POST(req: Request) {
   );
 
   const sig = req.headers.get("stripe-signature");
-  if (!sig) {
-    return new Response("Missing stripe-signature", { status: 400 });
-  }
+  if (!sig) return new Response("Missing stripe-signature", { status: 400 });
 
   const rawBody = await req.text();
 
@@ -43,7 +47,7 @@ export async function POST(req: Request) {
   try {
     event = stripe.webhooks.constructEvent(rawBody, sig, webhookSecret);
   } catch (err: any) {
-    console.error("❌ Webhook signature error:", err.message);
+    console.error("❌ Webhook signature error:", err?.message || err);
     return new Response("Invalid signature", { status: 400 });
   }
 
@@ -58,7 +62,7 @@ export async function POST(req: Request) {
         const billing = session.metadata?.billing;
 
         if (!userId || !plan || !billing) {
-          console.warn("⚠️ Missing metadata", session.id);
+          console.warn("⚠️ Missing metadata in session", session.id);
           break;
         }
 
@@ -66,17 +70,16 @@ export async function POST(req: Request) {
         let status = "active";
 
         if (session.subscription) {
-          const sub = unwrapStripe<Stripe.Subscription>(
-            await stripe.subscriptions.retrieve(
-              session.subscription as string
-            )
+          const retrieved = await stripe.subscriptions.retrieve(
+            session.subscription as string
           );
+          const sub = unwrapStripe<Stripe.Subscription>(retrieved) as any;
 
-          currentPeriodEnd = toIsoFromUnix(sub.current_period_end);
-          status = sub.status ?? "active";
+          currentPeriodEnd = getCurrentPeriodEndIso(sub);
+          status = sub?.status ?? "active";
         }
 
-        await supabase
+        const { error } = await supabase
           .from("subscriptions")
           .upsert(
             {
@@ -85,9 +88,7 @@ export async function POST(req: Request) {
               billing,
               status,
               stripe_customer_id:
-                typeof session.customer === "string"
-                  ? session.customer
-                  : null,
+                typeof session.customer === "string" ? session.customer : null,
               stripe_subscription_id:
                 typeof session.subscription === "string"
                   ? session.subscription
@@ -96,54 +97,66 @@ export async function POST(req: Request) {
               current_period_end: currentPeriodEnd,
               updated_at: new Date().toISOString(),
             },
-            {
-              onConflict: "supabase_user_id,plan",
-            }
+            { onConflict: "supabase_user_id,plan" }
           );
+
+        if (error) {
+          console.error("❌ Supabase upsert error:", error);
+          return new Response("DB upsert failed", { status: 500 });
+        }
 
         break;
       }
 
       /* ---------------- subscription updated ---------------- */
       case "customer.subscription.updated": {
-        const sub = unwrapStripe<Stripe.Subscription>(event.data.object);
+        const sub = unwrapStripe<Stripe.Subscription>(event.data.object) as any;
 
-        await supabase
+        const { error } = await supabase
           .from("subscriptions")
           .update({
-            status: sub.status,
-            current_period_end: toIsoFromUnix(sub.current_period_end),
+            status: sub?.status ?? "active",
+            current_period_end: getCurrentPeriodEndIso(sub),
             updated_at: new Date().toISOString(),
           })
           .eq("stripe_subscription_id", sub.id);
+
+        if (error) {
+          console.error("❌ Supabase update error:", error);
+          return new Response("DB update failed", { status: 500 });
+        }
 
         break;
       }
 
       /* ---------------- subscription deleted ---------------- */
       case "customer.subscription.deleted": {
-        const sub = unwrapStripe<Stripe.Subscription>(event.data.object);
+        const sub = unwrapStripe<Stripe.Subscription>(event.data.object) as any;
 
-        await supabase
+        const { error } = await supabase
           .from("subscriptions")
           .update({
             status: "canceled",
-            current_period_end: toIsoFromUnix(sub.current_period_end),
+            current_period_end: getCurrentPeriodEndIso(sub),
             updated_at: new Date().toISOString(),
           })
           .eq("stripe_subscription_id", sub.id);
+
+        if (error) {
+          console.error("❌ Supabase update error:", error);
+          return new Response("DB update failed", { status: 500 });
+        }
 
         break;
       }
 
       default:
-        // ignore other events
         break;
     }
 
     return new Response("ok", { status: 200 });
   } catch (err: any) {
-    console.error("❌ Webhook handler error:", err);
+    console.error("❌ Webhook handler error:", err?.message || err);
     return new Response("Webhook handler failed", { status: 500 });
   }
 }
