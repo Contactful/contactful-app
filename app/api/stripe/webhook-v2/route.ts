@@ -3,101 +3,139 @@ import { createClient } from "@supabase/supabase-js";
 
 export const runtime = "nodejs";
 
-/* -------------------- helpers -------------------- */
+type Plan = "talent" | "networking" | "bundle";
+type Billing = "monthly" | "yearly" | "lifetime";
 
-function assertEnv(name: string): string {
+function assertEnv(name: string) {
   const v = process.env[name];
   if (!v) throw new Error(`Missing env: ${name}`);
   return v;
 }
 
-function toIsoFromUnix(sec?: number | null): string | null {
-  return sec ? new Date(sec * 1000).toISOString() : null;
+function unwrapStripe<T>(obj: any): T {
+  // Stripe SDK bywa typowany jako Response<T> albo T – ujednolicamy:
+  if (obj && typeof obj === "object" && "data" in obj) return obj.data as T;
+  return obj as T;
 }
 
-/** Stripe v20 czasem zwraca Response<T>, czasem T */
-function unwrapStripe<T>(v: any): T {
-  return v && typeof v === "object" && "data" in v ? (v.data as T) : (v as T);
+function normalizePlan(p: any): Plan | null {
+  if (p === "talent" || p === "networking" || p === "bundle") return p;
+  return null;
 }
 
-/** Typy Stripe v20 potrafią nie mieć current_period_end → czytamy bezpiecznie */
-function getCurrentPeriodEndIso(sub: any): string | null {
-  const sec = sub?.current_period_end ?? sub?.currentPeriodEnd ?? null; // fallback
-  return typeof sec === "number" ? toIsoFromUnix(sec) : null;
+function normalizeBilling(b: any): Billing | null {
+  if (b === "monthly" || b === "yearly" || b === "lifetime") return b;
+  return null;
 }
 
-/* -------------------- handler -------------------- */
+function toIsoFromUnixSeconds(sec?: number | null) {
+  if (!sec) return null;
+  return new Date(sec * 1000).toISOString();
+}
+
+function getCurrentPeriodEndIso(sub: any) {
+  // w Stripe Subscription jest current_period_end (unix seconds)
+  return toIsoFromUnixSeconds(sub?.current_period_end ?? null);
+}
+
+function extractUserIdFromSession(session: any): string | null {
+  // Najważniejsze: metadata.supabase_user_id ustawiasz przy create-checkout-session
+  const meta = session?.metadata || {};
+  return (
+    meta?.supabase_user_id ||
+    session?.client_reference_id ||
+    null
+  );
+}
 
 export async function POST(req: Request) {
-  const stripe = new Stripe(assertEnv("STRIPE_SECRET_KEY"));
-  const webhookSecret = assertEnv("STRIPE_WEBHOOK_SECRET");
-
-  const supabase = createClient(
-    assertEnv("NEXT_PUBLIC_SUPABASE_URL"),
-    assertEnv("SUPABASE_SERVICE_ROLE_KEY"),
-    { auth: { persistSession: false } }
-  );
-
-  const sig = req.headers.get("stripe-signature");
-  if (!sig) return new Response("Missing stripe-signature", { status: 400 });
-
-  const rawBody = await req.text();
-
-  let event: Stripe.Event;
   try {
-    event = stripe.webhooks.constructEvent(rawBody, sig, webhookSecret);
-  } catch (err: any) {
-    console.error("❌ Webhook signature error:", err?.message || err);
-    return new Response("Invalid signature", { status: 400 });
-  }
+    const stripeSecret = assertEnv("STRIPE_SECRET_KEY");
+    const webhookSecret = assertEnv("STRIPE_WEBHOOK_SECRET");
+    const supabaseUrl = assertEnv("NEXT_PUBLIC_SUPABASE_URL");
+    const supabaseServiceRole = assertEnv("SUPABASE_SERVICE_ROLE_KEY");
 
-  try {
+    const stripe = new Stripe(stripeSecret);
+    const supabase = createClient(supabaseUrl, supabaseServiceRole, {
+      auth: { persistSession: false },
+    });
+
+    // Stripe wymaga RAW body do weryfikacji podpisu
+    const rawBody = await req.text();
+    const sig = req.headers.get("stripe-signature");
+    if (!sig) return new Response("Missing stripe-signature", { status: 400 });
+
+    let event: Stripe.Event;
+    try {
+      event = stripe.webhooks.constructEvent(rawBody, sig, webhookSecret);
+    } catch (err: any) {
+      return new Response(`Webhook signature verification failed: ${err?.message || String(err)}`, {
+        status: 400,
+      });
+    }
+
     switch (event.type) {
       /* ---------------- checkout completed ---------------- */
       case "checkout.session.completed": {
-        const session = event.data.object as Stripe.Checkout.Session;
+        const session = unwrapStripe<Stripe.Checkout.Session>(event.data.object as any) as any;
 
-        const userId = session.metadata?.supabase_user_id;
-        const plan = session.metadata?.plan;
-        const billing = session.metadata?.billing;
-
-        if (!userId || !plan || !billing) {
-          console.warn("⚠️ Missing metadata in session", session.id);
-          break;
+        const userId = extractUserIdFromSession(session);
+        if (!userId) {
+          console.error("❌ Missing user id in session.metadata.supabase_user_id / client_reference_id", {
+            session_id: session?.id,
+          });
+          return new Response("Missing user id", { status: 400 });
         }
 
-        let currentPeriodEnd: string | null = null;
+        const plan = normalizePlan(session?.metadata?.plan);
+        const billing = normalizeBilling(session?.metadata?.billing);
+
+        if (!plan || !billing) {
+          console.error("❌ Missing plan/billing in session.metadata", {
+            plan: session?.metadata?.plan,
+            billing: session?.metadata?.billing,
+            session_id: session?.id,
+          });
+          return new Response("Missing plan/billing", { status: 400 });
+        }
+
         let status = "active";
+        let currentPeriodEnd: string | null = null;
 
-        if (session.subscription) {
-          const retrieved = await stripe.subscriptions.retrieve(
-            session.subscription as string
-          );
-          const sub = unwrapStripe<Stripe.Subscription>(retrieved) as any;
+        const stripeCustomerId =
+          typeof session.customer === "string" ? session.customer : null;
 
+        const stripeSubscriptionId =
+          typeof session.subscription === "string" ? session.subscription : null;
+
+        // Jeśli to subskrypcja, pobierz current_period_end
+        if (stripeSubscriptionId) {
+          const retrieved = await stripe.subscriptions.retrieve(stripeSubscriptionId as any);
+          const sub = unwrapStripe<Stripe.Subscription>(retrieved as any) as any;
           currentPeriodEnd = getCurrentPeriodEndIso(sub);
           status = sub?.status ?? "active";
+        } else {
+          // lifetime/payment – zostaw null
+          currentPeriodEnd = null;
+          status = "active";
         }
 
+        // ✅ KLUCZOWA ZMIANA: zapis do kolumny user_id
         const { error } = await supabase
           .from("subscriptions")
           .upsert(
             {
-              supabase_user_id: userId,
+              user_id: userId, // <-- było supabase_user_id
               plan,
               billing,
               status,
-              stripe_customer_id:
-                typeof session.customer === "string" ? session.customer : null,
-              stripe_subscription_id:
-                typeof session.subscription === "string"
-                  ? session.subscription
-                  : null,
+              stripe_customer_id: stripeCustomerId,
+              stripe_subscription_id: stripeSubscriptionId,
               stripe_checkout_session_id: session.id,
               current_period_end: currentPeriodEnd,
               updated_at: new Date().toISOString(),
             },
-            { onConflict: "supabase_user_id,plan" }
+            { onConflict: "user_id,plan" } // <-- było supabase_user_id,plan
           );
 
         if (error) {
@@ -110,7 +148,7 @@ export async function POST(req: Request) {
 
       /* ---------------- subscription updated ---------------- */
       case "customer.subscription.updated": {
-        const sub = unwrapStripe<Stripe.Subscription>(event.data.object) as any;
+        const sub = unwrapStripe<Stripe.Subscription>(event.data.object as any) as any;
 
         const { error } = await supabase
           .from("subscriptions")
@@ -131,7 +169,7 @@ export async function POST(req: Request) {
 
       /* ---------------- subscription deleted ---------------- */
       case "customer.subscription.deleted": {
-        const sub = unwrapStripe<Stripe.Subscription>(event.data.object) as any;
+        const sub = unwrapStripe<Stripe.Subscription>(event.data.object as any) as any;
 
         const { error } = await supabase
           .from("subscriptions")
@@ -151,13 +189,14 @@ export async function POST(req: Request) {
       }
 
       default:
+        // ignore
         break;
     }
 
     return new Response("ok", { status: 200 });
   } catch (err: any) {
     console.error("❌ Webhook handler error:", err?.message || err);
-    return new Response("Webhook handler failed", { status: 500 });
+    return new Response(`Webhook handler failed: ${err?.message || String(err)}`, { status: 500 });
   }
 }
 
