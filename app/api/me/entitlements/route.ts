@@ -1,4 +1,7 @@
+import { NextResponse } from "next/server";
+import { cookies } from "next/headers";
 import { createClient } from "@supabase/supabase-js";
+import { createServerClient } from "@supabase/ssr";
 
 export const runtime = "nodejs";
 
@@ -8,97 +11,122 @@ function assertEnv(name: string) {
   return v;
 }
 
-function hasActiveRow(row: any) {
-  if (!row) return false;
-  if (row.status !== "active") return false;
+function getBearerToken(req: Request) {
+  const h = req.headers.get("authorization") || "";
+  const m = h.match(/^Bearer\s+(.+)$/i);
+  return m?.[1] || null;
+}
 
-  if (row.billing === "lifetime") return true;
-
-  // monthly/yearly – sprawdzamy datę
-  if (!row.current_period_end) return false;
-  return new Date(row.current_period_end).getTime() > Date.now();
+function isMissingColumnError(err: any, col: string) {
+  const msg = String(err?.message || "");
+  return msg.includes(`column "${col}" does not exist`);
 }
 
 export async function GET(req: Request) {
   try {
     const supabaseUrl = assertEnv("NEXT_PUBLIC_SUPABASE_URL");
-    const anonKey = assertEnv("NEXT_PUBLIC_SUPABASE_ANON_KEY");
+    const supabaseAnon = assertEnv("NEXT_PUBLIC_SUPABASE_ANON_KEY");
 
-    const authHeader = req.headers.get("authorization") || "";
-    const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
-    if (!token) {
-      return new Response(JSON.stringify({ error: "Missing Authorization: Bearer <access_token>" }), {
-        status: 401,
-        headers: { "content-type": "application/json" },
-      });
-    }
+    const bearer = getBearerToken(req);
 
-    const supabase = createClient(supabaseUrl, anonKey, {
-      auth: { persistSession: false },
-      global: { headers: { Authorization: `Bearer ${token}` } },
-    });
+    // ✅ Next 16: cookies() może być async → trzeba await
+    const cookieStore: any = await cookies();
 
+    const supabase = bearer
+      ? // ✅ Bearer flow (najpewniejszy): ANON + RLS po JWT
+        createClient(supabaseUrl, supabaseAnon, {
+          global: { headers: { Authorization: `Bearer ${bearer}` } },
+          auth: {
+            persistSession: false,
+            autoRefreshToken: false,
+            detectSessionInUrl: false,
+          },
+        })
+      : // ✅ Cookie flow (jeśli masz auth cookies Supabase w przeglądarce)
+        createServerClient(supabaseUrl, supabaseAnon, {
+          cookies: {
+            get(name: string) {
+              // cookieStore.get może nie istnieć jeśli coś się zmieni w Next – zabezpieczamy
+              const c = typeof cookieStore?.get === "function" ? cookieStore.get(name) : null;
+              return c?.value;
+            },
+            // Dla GET endpointu nie musimy ustawiać cookies → no-op (ale interfejs wymaga)
+            set() {},
+            remove() {},
+          },
+        });
+
+    // 1) user z JWT/cookies
     const { data: userData, error: userErr } = await supabase.auth.getUser();
     if (userErr || !userData?.user) {
-      return new Response(JSON.stringify({ error: "Invalid access token" }), {
-        status: 401,
-        headers: { "content-type": "application/json" },
-      });
+      return NextResponse.json(
+        {
+          error: bearer
+            ? "Invalid access token"
+            : "Not authenticated (no Bearer token and/or no valid auth cookies)",
+          details: userErr?.message || null,
+        },
+        { status: 401 }
+      );
     }
 
     const userId = userData.user.id;
 
-    const { data: rows, error } = await supabase
+    // 2) subscriptions query (obsłuż obie nazwy kolumn: supabase_user_id vs user_id)
+    const selectFields = "plan,billing,status,current_period_end";
+    let rows: any[] = [];
+
+    const q1 = await supabase
       .from("subscriptions")
-      .select("plan,billing,status,current_period_end")
-      .eq("user_id", userId);
+      .select(selectFields)
+      .eq("supabase_user_id", userId);
 
-    if (error) {
-      return new Response(JSON.stringify({ error: error.message }), {
-        status: 500,
-        headers: { "content-type": "application/json" },
-      });
-    }
+    if (!q1.error) {
+      rows = q1.data || [];
+    } else if (isMissingColumnError(q1.error, "supabase_user_id")) {
+      const q2 = await supabase
+        .from("subscriptions")
+        .select(selectFields)
+        .eq("user_id", userId);
 
-    const byPlan: Record<string, any> = {};
-    for (const r of rows || []) {
-      // jeśli masz kilka wpisów per plan, bierz “najlepszy” (lifetime > active > reszta)
-      const prev = byPlan[r.plan];
-      if (!prev) byPlan[r.plan] = r;
-      else {
-        const prevActive = hasActiveRow(prev);
-        const curActive = hasActiveRow(r);
-        if (!prevActive && curActive) byPlan[r.plan] = r;
-        if (prev.billing !== "lifetime" && r.billing === "lifetime") byPlan[r.plan] = r;
+      if (q2.error) {
+        return NextResponse.json(
+          { error: "DB query failed", details: q2.error.message },
+          { status: 500 }
+        );
       }
+      rows = q2.data || [];
+    } else {
+      return NextResponse.json(
+        { error: "DB query failed", details: q1.error.message },
+        { status: 500 }
+      );
     }
 
-    const talent = hasActiveRow(byPlan["talent"]);
-    const networking = hasActiveRow(byPlan["networking"]);
-    const bundle = hasActiveRow(byPlan["bundle"]);
+    // 3) entitlements
+    const active = (rows || []).filter((r) => r.status === "active");
 
-    // bundle daje oba
-    const entitlements = {
-      talent: bundle || talent,
-      networking: bundle || networking,
-      bundle,
-      source: {
-        talent: byPlan["talent"] || null,
-        networking: byPlan["networking"] || null,
-        bundle: byPlan["bundle"] || null,
+    const hasNetworking =
+      active.some((r) => r.plan === "networking") || active.some((r) => r.plan === "bundle");
+    const hasTalent =
+      active.some((r) => r.plan === "talent") || active.some((r) => r.plan === "bundle");
+    const hasBundle = active.some((r) => r.plan === "bundle");
+
+    return NextResponse.json({
+      user_id: userId,
+      entitlements: {
+        networking: hasNetworking,
+        talent: hasTalent,
+        bundle: hasBundle,
       },
-    };
-
-    return new Response(JSON.stringify(entitlements), {
-      status: 200,
-      headers: { "content-type": "application/json" },
+      subscriptions: rows || [],
     });
   } catch (e: any) {
-    return new Response(JSON.stringify({ error: e?.message || String(e) }), {
-      status: 500,
-      headers: { "content-type": "application/json" },
-    });
+    console.error("❌ /api/me/entitlements error:", e);
+    return NextResponse.json(
+      { error: "Server error", details: e?.message || String(e) },
+      { status: 500 }
+    );
   }
 }
-
 
