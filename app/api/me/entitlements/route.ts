@@ -1,3 +1,4 @@
+// app/api/me/entitlements/route.ts
 import { NextResponse } from "next/server";
 import { cookies } from "next/headers";
 import { createClient } from "@supabase/supabase-js";
@@ -22,6 +23,26 @@ function isMissingColumnError(err: any, col: string) {
   return msg.includes(`column "${col}" does not exist`);
 }
 
+/**
+ * CORS — potrzebne jeśli plugin wysyła Authorization header (preflight).
+ * Dla extension i tak zwykle zadziała, ale to najpewniejsze MVP.
+ */
+function withCors(res: NextResponse, req: Request) {
+  const origin = req.headers.get("origin") || "*";
+
+  res.headers.set("Access-Control-Allow-Origin", origin);
+  res.headers.set("Vary", "Origin");
+  res.headers.set("Access-Control-Allow-Credentials", "true");
+  res.headers.set("Access-Control-Allow-Methods", "GET,OPTIONS");
+  res.headers.set("Access-Control-Allow-Headers", "authorization,content-type");
+
+  return res;
+}
+
+export async function OPTIONS(req: Request) {
+  return withCors(new NextResponse(null, { status: 204 }), req);
+}
+
 export async function GET(req: Request) {
   try {
     const supabaseUrl = assertEnv("NEXT_PUBLIC_SUPABASE_URL");
@@ -29,7 +50,7 @@ export async function GET(req: Request) {
 
     const bearer = getBearerToken(req);
 
-    // ✅ Next 16: cookies() może być async → trzeba await
+    // Next 16: cookies() bywa async
     const cookieStore: any = await cookies();
 
     const supabase = bearer
@@ -42,15 +63,13 @@ export async function GET(req: Request) {
             detectSessionInUrl: false,
           },
         })
-      : // ✅ Cookie flow (jeśli masz auth cookies Supabase w przeglądarce)
+      : // ✅ Cookie flow (fallback)
         createServerClient(supabaseUrl, supabaseAnon, {
           cookies: {
             get(name: string) {
-              // cookieStore.get może nie istnieć jeśli coś się zmieni w Next – zabezpieczamy
               const c = typeof cookieStore?.get === "function" ? cookieStore.get(name) : null;
               return c?.value;
             },
-            // Dla GET endpointu nie musimy ustawiać cookies → no-op (ale interfejs wymaga)
             set() {},
             remove() {},
           },
@@ -59,7 +78,7 @@ export async function GET(req: Request) {
     // 1) user z JWT/cookies
     const { data: userData, error: userErr } = await supabase.auth.getUser();
     if (userErr || !userData?.user) {
-      return NextResponse.json(
+      const res = NextResponse.json(
         {
           error: bearer
             ? "Invalid access token"
@@ -68,11 +87,12 @@ export async function GET(req: Request) {
         },
         { status: 401 }
       );
+      return withCors(res, req);
     }
 
     const userId = userData.user.id;
 
-    // 2) subscriptions query (obsłuż obie nazwy kolumn: supabase_user_id vs user_id)
+    // 2) subscriptions query (obsłuż obie nazwy kolumn)
     const selectFields = "plan,billing,status,current_period_end";
     let rows: any[] = [];
 
@@ -90,17 +110,19 @@ export async function GET(req: Request) {
         .eq("user_id", userId);
 
       if (q2.error) {
-        return NextResponse.json(
+        const res = NextResponse.json(
           { error: "DB query failed", details: q2.error.message },
           { status: 500 }
         );
+        return withCors(res, req);
       }
       rows = q2.data || [];
     } else {
-      return NextResponse.json(
+      const res = NextResponse.json(
         { error: "DB query failed", details: q1.error.message },
         { status: 500 }
       );
+      return withCors(res, req);
     }
 
     // 3) entitlements
@@ -112,7 +134,7 @@ export async function GET(req: Request) {
       active.some((r) => r.plan === "talent") || active.some((r) => r.plan === "bundle");
     const hasBundle = active.some((r) => r.plan === "bundle");
 
-    return NextResponse.json({
+    const res = NextResponse.json({
       user_id: userId,
       entitlements: {
         networking: hasNetworking,
@@ -121,12 +143,16 @@ export async function GET(req: Request) {
       },
       subscriptions: rows || [],
     });
+
+    return withCors(res, req);
   } catch (e: any) {
     console.error("❌ /api/me/entitlements error:", e);
-    return NextResponse.json(
+
+    const res = NextResponse.json(
       { error: "Server error", details: e?.message || String(e) },
       { status: 500 }
     );
+    return withCors(res, req);
   }
 }
 
