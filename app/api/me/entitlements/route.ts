@@ -6,6 +6,8 @@ import { createServerClient } from "@supabase/ssr";
 
 export const runtime = "nodejs";
 
+/* ================= utils ================= */
+
 function assertEnv(name: string) {
   const v = process.env[name];
   if (!v) throw new Error(`Missing env: ${name}`);
@@ -23,18 +25,27 @@ function isMissingColumnError(err: any, col: string) {
   return msg.includes(`column "${col}" does not exist`);
 }
 
+/* ================= CORS ================= */
+
 /**
- * CORS — potrzebne jeśli plugin wysyła Authorization header (preflight).
- * Dla extension i tak zwykle zadziała, ale to najpewniejsze MVP.
+ * IMPORTANT:
+ * - credentials:true ⇒ Access-Control-Allow-Origin MUST NOT be "*"
+ * - Chrome extension sends Origin header → echo it back
+ * - fallback to app.contactful.app
  */
 function withCors(res: NextResponse, req: Request) {
-  const origin = req.headers.get("origin") || "*";
+  const origin =
+    req.headers.get("origin") ||
+    "https://app.contactful.app";
 
   res.headers.set("Access-Control-Allow-Origin", origin);
   res.headers.set("Vary", "Origin");
   res.headers.set("Access-Control-Allow-Credentials", "true");
   res.headers.set("Access-Control-Allow-Methods", "GET,OPTIONS");
-  res.headers.set("Access-Control-Allow-Headers", "authorization,content-type");
+  res.headers.set(
+    "Access-Control-Allow-Headers",
+    "authorization,content-type"
+  );
 
   return res;
 }
@@ -43,6 +54,8 @@ export async function OPTIONS(req: Request) {
   return withCors(new NextResponse(null, { status: 204 }), req);
 }
 
+/* ================= GET ================= */
+
 export async function GET(req: Request) {
   try {
     const supabaseUrl = assertEnv("NEXT_PUBLIC_SUPABASE_URL");
@@ -50,40 +63,51 @@ export async function GET(req: Request) {
 
     const bearer = getBearerToken(req);
 
-    // Next 16: cookies() bywa async
+    /**
+     * Next 16: cookies() bywa async
+     * getAll/setAll is REQUIRED for stable Supabase SSR
+     */
     const cookieStore: any = await cookies();
 
     const supabase = bearer
-      ? // ✅ Bearer flow (najpewniejszy): ANON + RLS po JWT
+      ? // ---------- Bearer flow (extension token bridge) ----------
         createClient(supabaseUrl, supabaseAnon, {
-          global: { headers: { Authorization: `Bearer ${bearer}` } },
+          global: {
+            headers: {
+              Authorization: `Bearer ${bearer}`,
+            },
+          },
           auth: {
             persistSession: false,
             autoRefreshToken: false,
             detectSessionInUrl: false,
           },
         })
-      : // ✅ Cookie flow (fallback)
+      : // ---------- Cookie flow (logged-in web app) ----------
         createServerClient(supabaseUrl, supabaseAnon, {
           cookies: {
-            get(name: string) {
-              const c = typeof cookieStore?.get === "function" ? cookieStore.get(name) : null;
-              return c?.value;
+            getAll() {
+              return cookieStore
+                .getAll()
+                .map((c: any) => ({ name: c.name, value: c.value }));
             },
-            set() {},
-            remove() {},
+            // GET endpoint → no writes needed
+            setAll() {},
           },
         });
 
-    // 1) user z JWT/cookies
-    const { data: userData, error: userErr } = await supabase.auth.getUser();
+    /* ---------- 1) AUTH ---------- */
+
+    const { data: userData, error: userErr } =
+      await supabase.auth.getUser();
+
     if (userErr || !userData?.user) {
       const res = NextResponse.json(
         {
           error: bearer
             ? "Invalid access token"
             : "Not authenticated (no Bearer token and/or no valid auth cookies)",
-          details: userErr?.message || null,
+          details: userErr?.message || "Auth session missing!",
         },
         { status: 401 }
       );
@@ -92,10 +116,12 @@ export async function GET(req: Request) {
 
     const userId = userData.user.id;
 
-    // 2) subscriptions query (obsłuż obie nazwy kolumn)
+    /* ---------- 2) SUBSCRIPTIONS ---------- */
+
     const selectFields = "plan,billing,status,current_period_end";
     let rows: any[] = [];
 
+    // try supabase_user_id first
     const q1 = await supabase
       .from("subscriptions")
       .select(selectFields)
@@ -104,6 +130,7 @@ export async function GET(req: Request) {
     if (!q1.error) {
       rows = q1.data || [];
     } else if (isMissingColumnError(q1.error, "supabase_user_id")) {
+      // fallback to user_id
       const q2 = await supabase
         .from("subscriptions")
         .select(selectFields)
@@ -125,14 +152,17 @@ export async function GET(req: Request) {
       return withCors(res, req);
     }
 
-    // 3) entitlements
-    const active = (rows || []).filter((r) => r.status === "active");
+    /* ---------- 3) ENTITLEMENTS ---------- */
 
-    const hasNetworking =
-      active.some((r) => r.plan === "networking") || active.some((r) => r.plan === "bundle");
-    const hasTalent =
-      active.some((r) => r.plan === "talent") || active.some((r) => r.plan === "bundle");
+    const active = (rows || []).filter(
+      (r) => r.status === "active"
+    );
+
     const hasBundle = active.some((r) => r.plan === "bundle");
+    const hasNetworking =
+      hasBundle || active.some((r) => r.plan === "networking");
+    const hasTalent =
+      hasBundle || active.some((r) => r.plan === "talent");
 
     const res = NextResponse.json({
       user_id: userId,
@@ -149,7 +179,10 @@ export async function GET(req: Request) {
     console.error("❌ /api/me/entitlements error:", e);
 
     const res = NextResponse.json(
-      { error: "Server error", details: e?.message || String(e) },
+      {
+        error: "Server error",
+        details: e?.message || String(e),
+      },
       { status: 500 }
     );
     return withCors(res, req);
