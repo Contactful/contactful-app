@@ -18,9 +18,7 @@ function isMissingColumnError(err: any, col: string) {
 
 export async function POST(req: Request) {
   try {
-    const stripe = new Stripe(assertEnv("STRIPE_SECRET_KEY"), {
-      apiVersion: "2024-06-20",
-    });
+    const stripe = new Stripe(assertEnv("STRIPE_SECRET_KEY"));
 
     const supabaseUrl = assertEnv("NEXT_PUBLIC_SUPABASE_URL");
     const supabaseAnon = assertEnv("NEXT_PUBLIC_SUPABASE_ANON_KEY");
