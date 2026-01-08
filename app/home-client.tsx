@@ -1,13 +1,15 @@
-// app/home-client.tsx
 "use client";
 
 import Link from "next/link";
 import { useEntitlements } from "@/app/lib/use-entitlements";
 import { PLAN_LABEL, type Plan } from "@/app/lib/pricing";
+import CancelSubscriptionButton from "@/app/components/CancelSubscriptionButton";
 
 export default function HomeClient() {
   const ent = useEntitlements();
   const plans = ent.entitlements?.entitlements;
+
+  const isLoggedIn = !!ent.entitlements?.user_id;
 
   const hasNetworking = !!plans?.networking || !!plans?.bundle;
   const hasTalent = !!plans?.talent || !!plans?.bundle;
@@ -26,9 +28,7 @@ export default function HomeClient() {
           Welcome to Contactful
         </h1>
 
-        <p className="mt-2 text-slate-600">
-          Manage your access and upgrade anytime.
-        </p>
+        <p className="mt-2 text-slate-600">Manage your access and upgrade anytime.</p>
 
         <div className="mt-5 flex flex-wrap items-center gap-2">
           <Link
@@ -38,12 +38,14 @@ export default function HomeClient() {
             Upgrade
           </Link>
 
-          <Link
-            href="/login"
-            className="rounded-xl border border-slate-600/25 bg-white px-4 py-2 text-sm font-semibold text-slate-900 transition hover:bg-slate-50"
-          >
-            Login
-          </Link>
+          {!isLoggedIn && (
+            <Link
+              href="/login"
+              className="rounded-xl border border-slate-600/25 bg-white px-4 py-2 text-sm font-semibold text-slate-900 transition hover:bg-slate-50"
+            >
+              Login
+            </Link>
+          )}
         </div>
 
         <div className="mt-6 rounded-xl border border-slate-600/20 bg-slate-50 p-4">
@@ -60,29 +62,26 @@ export default function HomeClient() {
 
           <div className="grid grid-cols-1 gap-2">
             {items.map((it) => (
-              <div
-                key={it.key}
-                className="rounded-2xl border border-slate-600/25 bg-white p-4"
-              >
+              <div key={it.key} className="rounded-2xl border border-slate-600/25 bg-white p-4">
                 <div className="flex items-center justify-between gap-3">
                   <div className="font-semibold text-slate-900">{it.label}</div>
 
-                  <span
-                    className={[
-                      "rounded-full border px-2 py-1 text-xs",
-                      it.active
-                        ? "border-emerald-600/25 bg-emerald-50 text-emerald-700"
-                        : "border-slate-600/25 bg-slate-50 text-slate-600",
-                    ].join(" ")}
-                  >
-                    {it.active ? "Active" : "Inactive"}
-                  </span>
+                  {it.active ? (
+                    <div className="flex flex-col items-end">
+                      <span className="rounded-full border border-emerald-600/25 bg-emerald-50 px-2 py-1 text-xs text-emerald-700">
+                        Active
+                      </span>
+                      <CancelSubscriptionButton />
+                    </div>
+                  ) : (
+                    <span className="rounded-full border border-slate-600/25 bg-slate-50 px-2 py-1 text-xs text-slate-600">
+                      Inactive
+                    </span>
+                  )}
                 </div>
 
                 <div className="mt-2 text-sm text-slate-600">
-                  {it.active
-                    ? "You have access to this plan."
-                    : "You don’t have access to this plan yet."}
+                  {it.active ? "You have access to this plan." : "You don’t have access to this plan yet."}
                 </div>
               </div>
             ))}
