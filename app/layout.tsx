@@ -12,9 +12,11 @@ export const metadata: Metadata = {
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="en" suppressHydrationWarning>
-      <body className="min-h-screen cf-bg" suppressHydrationWarning>
-        <div className="min-h-screen flex flex-col">
-          <header className="sticky top-0 z-50 border-b border-slate-200/70 bg-white/80 backdrop-blur">
+      {/* body bez cf-bg, żeby nic nie “przebijało” poza app shell */}
+      <body className="bg-white" suppressHydrationWarning>
+        {/* cf-bg przeniesione na wrapper */}
+        <div className="min-h-dvh flex flex-col cf-bg">
+          <header className="sticky top-0 z-50 border-b border-slate-200/70 bg-white/95 backdrop-blur">
             <div className="mx-auto max-w-6xl px-5 py-4 flex items-center justify-between gap-4">
               <Link href="/" className="flex items-center gap-3">
                 <Image
@@ -48,12 +50,12 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
             </div>
           </header>
 
-          {/* To usuwa “ściśnięcie” (content ma oddychać) */}
           <main className="mx-auto w-full max-w-6xl flex-1 px-5 py-10">
             {children}
           </main>
 
-          <footer className="border-t border-slate-200/70 bg-white/60">
+          {/* footer z tłem nieprzezroczystym, żeby nie było “fioletowych pasów” */}
+          <footer className="border-t border-slate-200/70 bg-white">
             <div className="mx-auto max-w-6xl px-5 py-6 text-sm text-slate-500 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
               <div>© {new Date().getFullYear()} Contactful</div>
               <div className="flex items-center gap-3">
