@@ -21,6 +21,8 @@ export default function HomeClient() {
     { key: "bundle", label: PLAN_LABEL.bundle, active: hasBundle },
   ];
 
+  const anyActive = hasNetworking || hasTalent || hasBundle;
+
   return (
     <div className="text-slate-600">
       <div className="mx-auto max-w-3xl rounded-2xl border border-slate-600/25 bg-white p-6 shadow-sm">
@@ -52,36 +54,44 @@ export default function HomeClient() {
           <div className="text-sm text-slate-600">
             Your plan is{" "}
             <span className="font-semibold text-slate-900">
-              {hasNetworking || hasTalent || hasBundle ? "active" : "inactive"}
+              {anyActive ? "active" : "inactive"}
             </span>
           </div>
         </div>
 
         <div className="mt-6">
-          <div className="text-sm font-semibold text-slate-900 mb-2">Entitlements</div>
+          <div className="mb-2 text-sm font-semibold text-slate-900">Entitlements</div>
 
           <div className="grid grid-cols-1 gap-2">
             {items.map((it) => (
-              <div key={it.key} className="rounded-2xl border border-slate-600/25 bg-white p-4">
+              <div
+                key={it.key}
+                className="rounded-2xl border border-slate-600/25 bg-white p-4"
+              >
                 <div className="flex items-center justify-between gap-3">
                   <div className="font-semibold text-slate-900">{it.label}</div>
 
-                  {it.active ? (
-                    <div className="flex flex-col items-end">
-                      <span className="rounded-full border border-emerald-600/25 bg-emerald-50 px-2 py-1 text-xs text-emerald-700">
-                        Active
-                      </span>
-                      <CancelSubscriptionButton />
-                    </div>
-                  ) : (
-                    <span className="rounded-full border border-slate-600/25 bg-slate-50 px-2 py-1 text-xs text-slate-600">
-                      Inactive
+                  <div className="flex items-center gap-2">
+                    <span
+                      className={[
+                        "rounded-full border px-2 py-1 text-xs",
+                        it.active
+                          ? "border-emerald-600/25 bg-emerald-50 text-emerald-700"
+                          : "border-slate-600/25 bg-slate-50 text-slate-600",
+                      ].join(" ")}
+                    >
+                      {it.active ? "Active" : "Inactive"}
                     </span>
-                  )}
+
+                    {/* X tylko gdy aktywny plan */}
+                    {it.active ? <CancelSubscriptionButton /> : null}
+                  </div>
                 </div>
 
                 <div className="mt-2 text-sm text-slate-600">
-                  {it.active ? "You have access to this plan." : "You don’t have access to this plan yet."}
+                  {it.active
+                    ? "You have access to this plan."
+                    : "You don’t have access to this plan yet."}
                 </div>
               </div>
             ))}
